@@ -133,12 +133,23 @@ class WooCommerceService
 
         add_action('woocommerce_store_api_checkout_order_processed', [self::class, 'orderCreated'], 10, 1);
         add_action('woocommerce_checkout_order_created', [self::class, 'orderCreated'], 10, 1);
+        add_action('woocommerce_checkout_order_exception', [self::class, 'checkoutOrderException'], 10, 1);
 
         add_action('template_redirect', [self::class, 'beforeCheckoutForm']);
 
         add_action('woocommerce_new_order', function ($order_id) {
+            if (defined('WOOCOMMERCE_CHECKOUT') && constant('WOOCOMMERCE_CHECKOUT')) {
+                return;
+            }
+
             $order = wc_get_order($order_id);
-            self::orderCreated($order);
+
+            if ($order) {
+                try {
+                    self::orderCreated($order);
+                } catch (\Exception $e) {
+                }
+            }
         }, 10, 1);
     }
 
@@ -2900,6 +2911,67 @@ class WooCommerceService
     }
 
     /**
+     * Get booking creation error text.
+     *
+     * @param CommandResult $result
+     * @param array         $data
+     *
+     * @return string
+     */
+    private static function getBookingCreationFailureMessage($result, $data)
+    {
+        $errorMessage = self::getBookingErrorMessage($result, $data['type']);
+
+        if (!$errorMessage && $result->getMessage()) {
+            $errorMessage = $result->getMessage();
+        }
+
+        return $errorMessage ?: FrontendStrings::getCommonStrings()['time_slot_unavailable'];
+    }
+
+    /**
+     * Mark Amelia order item booking creation as failed.
+     *
+     * @param $order
+     * @param int    $itemId
+     * @param array  $data
+     * @param string $errorMessage
+     */
+    private static function markBookingCreationFailed($order, $itemId, $data, $errorMessage)
+    {
+        $data['booked'] = false;
+        $data['bookingError'] = wp_strip_all_tags($errorMessage);
+
+        unset($data['processed']);
+
+        wc_update_order_item_meta($itemId, self::AMELIA, $data);
+
+        if (method_exists($order, 'add_order_note')) {
+            $order->add_order_note(
+                sprintf(
+                    'Amelia booking was not created for order item #%1$d. Reason: %2$s',
+                    $itemId,
+                    $data['bookingError']
+                )
+            );
+        }
+
+        wc_get_logger()->error(
+            'Amelia booking was not created for WooCommerce order item.',
+            [
+                'source'        => 'amelia-woocommerce',
+                'order_id'      => method_exists($order, 'get_id') ? $order->get_id() : null,
+                'order_item_id' => $itemId,
+                'service_id'    => isset($data['serviceId']) ? $data['serviceId'] : null,
+                'provider_id'   => isset($data['providerId']) ? $data['providerId'] : null,
+                'booking_start' => isset($data['bookingStart']) ? $data['bookingStart'] : null,
+                'booking_end'   => isset($data['bookingEnd']) ? $data['bookingEnd'] : null,
+                'error'         => $data['bookingError'],
+            ]
+        );
+    }
+
+    /**
      * @param $order
      * @throws ContainerException
      * @throws QueryExecutionException
@@ -2925,6 +2997,23 @@ class WooCommerceService
     }
 
     /**
+     * Manage Amelia data after WooCommerce discards an order during checkout.
+     *
+     * @param $order
+     */
+    public static function checkoutOrderException($order)
+    {
+        if (!$order || !self::isAmeliaOrder($order)) {
+            return;
+        }
+
+        try {
+            self::manageOrderCreationFailed($order);
+        } catch (\Exception $e) {
+        }
+    }
+
+    /**
      * @param $order_id
      * @throws BookingCancellationException
      * @throws ContainerException
@@ -2939,8 +3028,20 @@ class WooCommerceService
 
         if (self::isAmeliaOrder($order)) {
             if (self::isAmeliaOrderValidForBooking($order) && self::isAmeliaOrderProcessed($order)) {
+                if (self::hasUnbookedAmeliaItems($order)) {
+                    self::manageOrderCreationFailed($order);
+
+                    return;
+                }
+
                 self::manageOrderUpdateStatus($order);
             } elseif (self::isAmeliaOrderValidForBooking($order)) {
+                if ($order->get_status() !== 'pending' && self::hasUnbookedAmeliaItems($order)) {
+                    self::manageOrderCreationFailed($order);
+
+                    return;
+                }
+
                 if (self::isAmeliaOrderFromPaymentLink($order)) {
                     self::managePaymentCreatedFromPaymentLink($order);
                 } elseif ($order->get_status() !== 'pending') {
@@ -2986,6 +3087,26 @@ class WooCommerceService
                 if (isset($data['processed'], $data['payment']['wcOrderId'])) {
                     return true;
                 }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Inspect if every Amelia order item has created its Amelia booking.
+     *
+     * @param $order
+     *
+     * @return bool
+     */
+    private static function hasUnbookedAmeliaItems($order)
+    {
+        foreach ($order->get_items() as $item_id => $order_item) {
+            $data = wc_get_order_item_meta($item_id, self::AMELIA);
+
+            if ($data && is_array($data) && array_key_exists('booked', $data) && empty($data['booked'])) {
+                return true;
             }
         }
 
@@ -3214,13 +3335,14 @@ class WooCommerceService
                     $data &&
                     (!$inspectRules || self::isValid($order->get_status(), $data) !== false) &&
                     !array_key_exists($key, self::$processedAmeliaItems) &&
-                    !array_key_exists('booked', $data) &&
+                    empty($data['booked']) &&
                     !empty($data) &&
                     !isset($data['processed'])
                 ) {
                     self::$processedAmeliaItems[$key] = true;
 
                     $data['booked'] = false;
+                    unset($data['bookingError']);
 
                     wc_update_order_item_meta($item_id, self::AMELIA, $data);
 
@@ -3240,16 +3362,18 @@ class WooCommerceService
 
                     $result = $reservationService->processRequest($data, $reservation, true);
 
-                    if (!$paid && $result->getResult() === CommandResult::RESULT_ERROR) {
+                    if ($result->getResult() === CommandResult::RESULT_ERROR) {
                         $cartUrl = self::getPageUrl($data);
 
                         $removeAppointmentMessage = FrontendStrings::getCommonStrings()['wc_appointment_is_removed'];
 
-                        $errorMessage = self::getBookingErrorMessage($result, $data['type']);
+                        $errorMessage = self::getBookingCreationFailureMessage($result, $data);
 
-                        if ($errorMessage) {
+                        if (!$paid) {
                             throw new \Exception($errorMessage . "<a href='{$cartUrl}'>{$removeAppointmentMessage}</a>");
                         }
+
+                        throw new \Exception($errorMessage);
                     }
 
                     /** @var PaymentRepository $paymentRepository */
@@ -3297,10 +3421,15 @@ class WooCommerceService
                     $data['recurring'] = [];
 
                     $data['booked'] = true;
+                    unset($data['bookingError']);
 
                     wc_update_order_item_meta($item_id, self::AMELIA, $data);
                 }
             } catch (\Exception $e) {
+                if ($data && is_array($data)) {
+                    self::markBookingCreationFailed($order, $item_id, $data, $e->getMessage());
+                }
+
                 if (!$paid) {
                     throw new \Exception($e->getMessage());
                 }
@@ -3473,7 +3602,7 @@ class WooCommerceService
         foreach ($order->get_items() as $item_id => $order_item) {
             $data = wc_get_order_item_meta($item_id, self::AMELIA);
 
-            if ($data && is_array($data)) {
+            if ($data && is_array($data) && !empty($data['booked'])) {
                 $data['processed'] = true;
 
                 wc_update_order_item_meta($item_id, self::AMELIA, $data);
